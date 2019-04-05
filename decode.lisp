@@ -35,6 +35,20 @@
     :general-string
     :character-string))
 
+(defstruct entity
+  (tag)
+  (tag-start 0 :type fixnum)
+  (content-start 0 :type fixnum)
+  (end 0 :type fixnum)
+  (content))
+
+;; see sb-kernel::%default-structure-pretty-print 
+(defmethod print-object ((obj entity) stream)
+  (print-unreadable-object (obj stream :type nil :identity nil)
+    (with-slots (tag tag-start content-start end content) obj
+    (format stream "ASN1 [~d/~d:~d] ~s~_ ~<~{~s~^~@_~}~:@>"
+            tag-start content-start end tag (list (list content))))))
+
 (deftype octets (&optional (len '*)) `(simple-array (unsigned-byte 8) (,len)))
 
 (declaim (ftype (function (octets fixnum fixnum) integer) bytes-to-integer))
@@ -99,40 +113,47 @@
                (declare (type fixnum end))
                (values p end tag is-component)))))))))
 
-(defun decode (data &key (start 0) (end (length data)))
+(defun decode (data &key (start 0) (end (length data))
+                    (return-entities))
   (declare (optimize speed))
   (declare (type octets data)
            (type fixnum start end))
   (multiple-value-bind (chunk-start chunk-end tag recursivep)
       (read-block data :start start)
     (declare (type fixnum chunk-start chunk-end))
-    (cons
-     (cons tag
-           (if recursivep
-               (decode data :start chunk-start :end chunk-end)
-               (case tag
-                 (:integer
-                  (bytes-to-integer data chunk-start chunk-end))
-                 (:sequence
-                  (decode data :start chunk-start :end chunk-end))
-                 (:bit-string
-                  (let ((unused-bits (aref data chunk-start))
-                        (res (subseq data (1+ chunk-start) chunk-end)))
-                    (unless (= unused-bits 0)
-                      (setf (aref res (1- chunk-end))
-                            (logxor (aref res (1- chunk-end))
-                                    (1- (expt 2 unused-bits)))))
-                    res))
-                 (:octet-string
-                  (subseq data chunk-start chunk-end))
-                 (:object-identifier
-                  (bytes-to-oid data chunk-start chunk-end))
-                 (:boolean
-                  (unless (= 1 (- chunk-end chunk-start))
-                    (error "Too long boolean"))
-                  (/= 0 (aref data chunk-start)))
-                 (:null)
-                 (otherwise
-                  (subseq data chunk-start chunk-end)))))
-     (when (< chunk-end end)
-       (decode data :start chunk-end :end end)))))
+    (let ((decd (if recursivep
+                  (decode data :start chunk-start :end chunk-end :return-entities return-entities)
+                  (case tag
+                    (:integer
+                      (bytes-to-integer data chunk-start chunk-end))
+                    (:sequence
+                      (decode data :start chunk-start :end chunk-end :return-entities return-entities))
+                    (:bit-string
+                      (let ((unused-bits (aref data chunk-start))
+                            (res (subseq data (1+ chunk-start) chunk-end)))
+                        (unless (= unused-bits 0)
+                          (setf (aref res (1- chunk-end))
+                                (logxor (aref res (1- chunk-end))
+                                        (1- (expt 2 unused-bits)))))
+                        res))
+                    (:octet-string
+                      (subseq data chunk-start chunk-end))
+                    (:object-identifier
+                      (bytes-to-oid data chunk-start chunk-end))
+                    (:boolean
+                      (unless (= 1 (- chunk-end chunk-start))
+                        (error "Too long boolean"))
+                      (/= 0 (aref data chunk-start)))
+                    (:null)
+                    (otherwise
+                      (subseq data chunk-start chunk-end)))))
+          (followup (when (< chunk-end end)
+                      (decode data :start chunk-end :end end :return-entities return-entities))))
+      (if return-entities
+        (make-entity :tag tag
+                     :tag-start start
+                     :content-start chunk-start
+                     :end chunk-end
+                     :content (cons decd followup))
+        (cons (cons tag decd)
+              followup)))))
